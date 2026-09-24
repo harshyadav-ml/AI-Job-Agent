@@ -54,4 +54,5 @@ Thumbs.db
 htmlcov/
 
 # Firecrawl
-.firecrawl/
+.firecrawl/naukri_debug.png
+project_dump.txt
