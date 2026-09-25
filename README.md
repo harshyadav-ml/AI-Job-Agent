@@ -224,3 +224,5 @@ This project is for educational purposes. Please respect the terms of service of
 ## Disclaimer
 
 This tool is for personal and educational use only. Users are responsible for ensuring their use complies with the terms of service of the respective job boards and applicable laws and regulations.
+---
+*Maintained by [harshyadav-ml](https://github.com/harshyadav-ml)*
