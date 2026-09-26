@@ -62,7 +62,8 @@ class DataNormalizer:
             'url': job.get('url', ''),
             'posted_date': self._normalize_date(job.get('posted_date', job.get('posting_date', ''))),
             'job_type': self._normalize_job_type(job.get('job_type', '')),
-            'source': job.get('source', 'unknown')
+            'source': job.get('source', 'unknown'),
+            'scraped_at': job.get('scraped_at', '')
         }
         
         return normalized

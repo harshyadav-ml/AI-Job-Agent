@@ -21,6 +21,7 @@ class WellfoundScraper(BaseScraper):
         load_dotenv()
         self.api_key = os.environ.get("FIRECRAWL_API_KEY", "").strip() or getattr(settings, "FIRECRAWL_API_KEY", "")
         self._custom_firecrawl = firecrawl
+        self._firecrawl_explicitly_set = firecrawl is not None
 
     @property
     def source_name(self) -> str:
@@ -28,7 +29,7 @@ class WellfoundScraper(BaseScraper):
 
     @property
     def firecrawl(self):
-        if self._custom_firecrawl is not None:
+        if self._firecrawl_explicitly_set:
             return self._custom_firecrawl
         if not self.api_key:
             return None
@@ -45,6 +46,7 @@ class WellfoundScraper(BaseScraper):
     @firecrawl.setter
     def firecrawl(self, value):
         self._custom_firecrawl = value
+        self._firecrawl_explicitly_set = True
 
     @staticmethod
     def _slugify(text: str) -> str:

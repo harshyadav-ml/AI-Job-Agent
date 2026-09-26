@@ -86,7 +86,7 @@ class CSVWriter:
         
         try:
             with open(filepath, mode, newline='', encoding='utf-8') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=self.fieldnames)
+                writer = csv.DictWriter(csvfile, fieldnames=self.fieldnames, extrasaction='ignore')
                 
                 if write_header:
                     writer.writeheader()

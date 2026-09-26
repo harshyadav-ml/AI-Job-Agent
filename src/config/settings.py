@@ -50,6 +50,7 @@ class Settings:
     REQUEST_DELAY: float = float(os.getenv("REQUEST_DELAY", "2"))
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
     TIMEOUT: int = int(os.getenv("TIMEOUT", "30"))
+    BROWSER_TIMEOUT: int = int(os.getenv("BROWSER_TIMEOUT", "30"))  # Browser timeout in seconds (30s)
     
     # Naukri Configuration
     NAUKRI_USER_AGENT: str = os.getenv(

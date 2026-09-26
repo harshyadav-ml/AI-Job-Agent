@@ -83,13 +83,14 @@ def test_scraper_initialization():
     assert scraper.base_url == "https://www.naukri.com"
     assert "article.jobTuple" in scraper.JOB_CARD_SELECTORS
     assert "styles_job-listing-container" in scraper.JOB_CARD_SELECTORS
-    assert scraper.browser_timeout == 15000
+    assert scraper.browser_timeout == 30000
     assert scraper.USER_AGENT.startswith("Mozilla/5.0 (Macintosh")
 
 
 def test_scrape_jobs_uses_browser_search_url():
     scraper = NaukriScraper()
-    with patch.object(scraper, "_scrape_with_browser", return_value=[]) as mock_browser:
+    with patch.object(scraper, "_scrape_with_browser", return_value=[]) as mock_browser, \
+         patch.object(scraper, "_scrape_with_http", return_value=[]):
         jobs = scraper.scrape_jobs(["product manager"], ["bangalore"])
 
     assert jobs == []
@@ -124,15 +125,45 @@ def test_scrape_page_waits_for_cards_and_maps_rendered_dom():
     assert page.goto_calls[0][0].endswith("python-developer-jobs-in-bangalore")
     assert page.wait_calls[0] == (
         ".cust-job-tuple, [data-job-id], .srp-jobtuple-wrapper, div.row1",
-        {"timeout": 10000},
+        {"timeout": 30000},
     )
     assert page.evaluate_script == "window.scrollBy(0, 500)"
 
 
+def test_scrape_page_falls_back_to_beautifulsoup_on_wait_timeout():
+    scraper = NaukriScraper()
+    page = MagicMock()
+    page.wait_for_selector.side_effect = Exception("Timeout 30000ms exceeded")
+    page.content.return_value = """
+    <div class="srp-jobtuple-wrapper">
+        <a class="title" href="/job-details/python-dev-123">Python Developer</a>
+        <a class="comp-name">Acme Corp</a>
+        <span class="loc-wrap">Bangalore</span>
+    </div>
+    """
+    with patch.object(scraper, "_rate_limit"):
+        jobs = scraper._scrape_page(page, "https://www.naukri.com/python-developer-jobs")
+
+    assert len(jobs) == 1
+    assert jobs[0].title == "Python Developer"
+    assert jobs[0].company == "Acme Corp"
+    assert jobs[0].location == "Bangalore"
+
+
 def test_scrape_jobs_returns_empty_when_playwright_fails():
     scraper = NaukriScraper()
-    with patch.object(scraper, "_scrape_with_browser", return_value=[]):
+    with patch.object(scraper, "_scrape_with_browser", return_value=[]), \
+         patch.object(scraper, "_scrape_with_http", return_value=[]):
         assert scraper.scrape_jobs(["python developer"], ["pune"]) == []
+
+
+def test_scrape_jobs_falls_back_to_http_parser():
+    scraper = NaukriScraper()
+    with patch.object(scraper, "_scrape_with_browser", return_value=[]), \
+         patch.object(scraper, "_scrape_with_http", return_value=[make_job()]) as mock_http:
+        jobs = scraper.scrape_jobs(["python developer"], ["bangalore"])
+        assert len(jobs) == 1
+        mock_http.assert_called_once()
 
 
 def test_api_fallback_maps_job_details():
