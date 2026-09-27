@@ -56,3 +56,5 @@ htmlcov/
 # Firecrawl
 .firecrawl/naukri_debug.png
 project_dump.txt
+*.png
+project_dump.txt
