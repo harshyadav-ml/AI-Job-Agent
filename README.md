@@ -150,6 +150,42 @@ For each job, the following information is captured:
 - **Source**: Platform where the job was found (naukri, remoteok, wellfound)
 - **Scraped At**: Timestamp when the job was scraped
 
+## Querying and Viewing Data
+
+### Querying with DuckDB / SQL
+When querying exported CSV datasets in DuckDB, always specify `header=true` to guarantee that the first row is treated as column headers:
+
+```sql
+SELECT 
+    title,
+    company,
+    location,
+    salary,
+    job_type,
+    source
+FROM read_csv('data/jobs_*.csv', header=true)
+WHERE salary != 'Not specified';
+```
+
+Or run via Python DuckDB:
+```python
+import duckdb
+conn = duckdb.connect()
+df = conn.execute("SELECT * FROM read_csv('data/jobs_*.csv', header=true)").df()
+```
+
+### Viewing in VS Code (Edit CSV / Rainbow CSV)
+Workspace configuration in `.vscode/settings.json` sets:
+```json
+{
+  "csv-edit.readOption_hasHeader": "true",
+  "csv-edit.writeOption_hasHeader": "true",
+  "csv-edit.tryToGuessHasHeader": true,
+  "rainbow_csv.rbql_with_headers": true
+}
+```
+This ensures the first line is always recognized as the column header instead of data rows.
+
 ## Development
 
 ### Running Tests
