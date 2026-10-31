@@ -39,7 +39,7 @@ def test_scrape_jobs_calls_firecrawl_and_maps_html():
     assert "₹12,00,000" in jobs[0].salary
     assert set(jobs[0].to_dict()) == {
         "title", "company", "location", "description", "salary", "url",
-        "posted_date", "job_type", "source", "scraped_at",
+        "posted_date", "job_type", "source", "scraped_at", "experience_raw", "max_experience_required",
     }
 
 

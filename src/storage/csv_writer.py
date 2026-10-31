@@ -40,6 +40,8 @@ class CSVWriter:
             'location',
             'description',
             'salary',
+            'experience_raw',
+            'max_experience_required',
             'url',
             'posted_date',
             'job_type',
@@ -117,6 +119,11 @@ class CSVWriter:
                     if 'posted_date' not in df.columns and 'posting_date' in df.columns:
                         df['posted_date'] = df['posting_date']
                 
+                # Ensure all expected fieldnames exist in the DataFrame
+                for col in self.fieldnames:
+                    if col not in df.columns:
+                        df[col] = ""
+
                 # Order columns matching fieldnames first, then any extra columns
                 cols = [c for c in self.fieldnames if c in df.columns]
                 extra_cols = [c for c in df.columns if c not in self.fieldnames]

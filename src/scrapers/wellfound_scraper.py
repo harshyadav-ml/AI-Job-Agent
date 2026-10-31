@@ -16,9 +16,16 @@ from typing import Any, List, Optional
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+try:
+    from playwright.async_api import async_playwright
+    _PLAYWRIGHT_ASYNC_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_ASYNC_AVAILABLE = False
+
 from src.config import settings
 from src.models import Job
 from src.scrapers.base import BaseScraper
+from src.utils.ua_rotator import get_random_ua
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +65,112 @@ class WellfoundScraper(BaseScraper):
         except Exception as exc:
             logger.error("[wellfound] scrape failed: %s", exc, exc_info=True)
             return []
+
+    async def fetch_full_description(self, url: str) -> str:
+        """
+        Navigate to the job detail page with async Playwright and extract the full body text.
+
+        Instead of relying on a single rigid CSS class, extracts all text from the main
+        job content region. This handles varied headings like "About the role",
+        "Roles and Responsibilities", "Requirements", etc.
+        """
+        if not url:
+            return ""
+
+        if _PLAYWRIGHT_ASYNC_AVAILABLE:
+            try:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=[
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--disable-gpu",
+                        ],
+                    )
+                    context = await browser.new_context(
+                        user_agent=get_random_ua(),
+                        viewport={"width": 1366, "height": 768},
+                        locale="en-US",
+                    )
+                    page = await context.new_page()
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+
+                        # Wait for any recognizable content block to appear
+                        wait_selector = (
+                            ".job-description, [data-testid*='job-description'], "
+                            "div[class*='description'], section[class*='description'], "
+                            "[class*='styles_description'], main, article"
+                        )
+                        try:
+                            await page.wait_for_selector(wait_selector, timeout=8000)
+                        except Exception:
+                            pass
+
+                        content = await page.content()
+                        text = self._extract_body_text(content)
+                        if text and len(text) > 80:
+                            return text
+                    finally:
+                        await context.close()
+                        await browser.close()
+            except Exception as exc:
+                logger.warning("[wellfound] async playwright deep scrape failed for %s: %s", url, exc)
+
+        if self.firecrawl:
+            try:
+                res = await asyncio.to_thread(self.firecrawl.scrape_url, url, formats=["markdown", "html"])
+                md = res.get("markdown") if isinstance(res, dict) else getattr(res, "markdown", "")
+                if md and len(md.strip()) > 80:
+                    return md.strip()
+            except Exception as fc_exc:
+                logger.debug("[wellfound] Firecrawl fallback failed for %s: %s", url, fc_exc)
+
+        return ""
+
+    @staticmethod
+    def _extract_body_text(html: str) -> str:
+        """
+        Extract clean, full-body text from a Wellfound job detail page.
+
+        Removes nav/header/footer noise, then walks a selector waterfall
+        from the most-specific job-content container down to <main>/<article>.
+        Returns newline-delimited, de-duplicated paragraphs.
+        """
+        if not html:
+            return ""
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Strip chrome noise before extracting text
+        for tag in soup.select(
+            "nav, header, footer, script, style, "
+            "[class*='apply-btn'], [class*='sidebar'], [class*='social'], "
+            "[class*='navbar'], [class*='cookie'], [aria-label='navigation']"
+        ):
+            tag.decompose()
+
+        # Ordered waterfall: most-specific Wellfound selectors first, fallback to semantic HTML
+        candidates = [
+            ".job-description",
+            "[data-testid*='job-description']",
+            "div[class*='description']",
+            "section[class*='description']",
+            "[class*='styles_description']",
+            "[class*='jobDescription']",
+            "main",
+            "article",
+        ]
+        for sel in candidates:
+            el = soup.select_one(sel)
+            if el:
+                text = el.get_text(separator="\n", strip=True)
+                text = re.sub(r"\n{3,}", "\n\n", text).strip()
+                if len(text) > 80:
+                    return text
+
+        return ""
 
     # ------------------------------------------------------------------ #
     # Firecrawl client property                                           #
@@ -147,10 +260,39 @@ class WellfoundScraper(BaseScraper):
                 logger.warning("[wellfound-html] dropping card '%s' without URL", title)
                 continue
 
-            # 4. Salary extraction from text if present
+            # 4. Salary & experience extraction from card text/badges if present
             card_text = card.get_text(" ", strip=True)
             sal_match = re.search(r"([₹$€£][\d,]+(?:\s*[-–to]+\s*[₹$€£]?[\d,]+)?)", card_text)
             salary = sal_match.group(1) if sal_match else "Not specified"
+
+            exp_match = re.search(
+                r"\b(\d+\s*[-–to]+\s*\d+\s*(?:yrs?|years?)|(?:\d+\+?\s*(?:yrs?|years?)\s*(?:exp|experience)?))\b",
+                card_text,
+                re.IGNORECASE,
+            )
+            experience_raw = exp_match.group(1).strip() if exp_match else None
+
+            # 5. Description extraction (skill tags/badges or snippet text)
+            desc_tokens: list[str] = []
+            for el in card.select(
+                "[data-testid*='tag'], [data-testid*='badge'], span[class*='tag'], "
+                "span[class*='badge'], div[class*='tag'], div[class*='badge'], [class*='skill'], "
+                "[class*='theme_tag']"
+            ):
+                txt = el.get_text(strip=True)
+                if txt and txt not in desc_tokens and txt != title and txt != company:
+                    desc_tokens.append(txt)
+
+            for el in card.select("p, [class*='snippet'], [class*='description'], div[class*='details']"):
+                txt = el.get_text(" ", strip=True)
+                if txt and txt not in desc_tokens and txt != title and txt != company:
+                    desc_tokens.append(txt)
+
+            if desc_tokens:
+                description = " | ".join(desc_tokens)
+            else:
+                cleaned_card = re.sub(r"\s+", " ", card_text).strip()
+                description = cleaned_card if cleaned_card else f"{title} role at {company}"
 
             loc = search_location.title() if search_location else "Remote"
             job_type = "Internship" if "intern" in title.lower() else "Full-time"
@@ -162,7 +304,8 @@ class WellfoundScraper(BaseScraper):
                     location=loc,
                     salary=salary,
                     salary_raw=salary if salary != "Not specified" else None,
-                    description="",
+                    experience_raw=experience_raw,
+                    description=description,
                     url=href,
                     source="wellfound",
                     job_type=job_type,
@@ -195,9 +338,10 @@ class WellfoundScraper(BaseScraper):
                         continue
                     company = None
 
-                    # Check surrounding lines for company link
+                    # Check surrounding lines for company link and experience badges
                     start = max(0, i - 2)
                     end = min(len(lines), i + 3)
+                    experience_raw = None
                     for neighbor_line in lines[start:end]:
                         comp_match = re.search(
                             r"\[([^\]]+)\]\(https?://[^\)]*wellfound\.com/company/[^\)]+\)",
@@ -206,9 +350,29 @@ class WellfoundScraper(BaseScraper):
                         )
                         if comp_match:
                             company = comp_match.group(1).strip()
-                            break
+                        exp_match = re.search(
+                            r"\b(\d+\s*[-–to]+\s*\d+\s*(?:yrs?|years?)|(?:\d+\+?\s*(?:yrs?|years?)\s*(?:exp|experience)?))\b",
+                            neighbor_line,
+                            re.IGNORECASE,
+                        )
+                        if exp_match:
+                            experience_raw = exp_match.group(1).strip()
 
                     comp_name = company or "Startup (Wellfound)"
+
+                    # 5. Extract skill badges / snippet lines from surrounding context
+                    desc_tokens = []
+                    for neighbor_line in lines[start:end]:
+                        cleaned_line = neighbor_line.strip()
+                        if not cleaned_line or href in cleaned_line:
+                            continue
+                        plain = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", cleaned_line)
+                        plain = re.sub(r"[*#_`]", "", plain).strip()
+                        if plain and plain != title and plain != comp_name and plain not in desc_tokens:
+                            desc_tokens.append(plain)
+
+                    description = " | ".join(desc_tokens) if desc_tokens else f"{title} role at {comp_name}"
+
                     loc = search_location.title() if search_location else "Remote"
                     job_type = "Internship" if "intern" in title.lower() else "Full-time"
                     jobs.append(
@@ -218,7 +382,8 @@ class WellfoundScraper(BaseScraper):
                             location=loc,
                             salary="Not specified",
                             salary_raw=None,
-                            description="",
+                            experience_raw=experience_raw,
+                            description=description,
                             url=href,
                             source="wellfound",
                             job_type=job_type,

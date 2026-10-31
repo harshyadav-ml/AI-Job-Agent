@@ -72,6 +72,18 @@ class BaseScraper(ABC):
             ``True`` if the endpoint responds with a success status.
         """
 
+    @abstractmethod
+    async def fetch_full_description(self, url: str) -> str:
+        """
+        Fetch the complete job description text from the job detail page.
+
+        Args:
+            url: The canonical URL of the job listing.
+
+        Returns:
+            The full extracted text of the job description (roles, responsibilities, requirements).
+        """
+
     # ------------------------------------------------------------------ #
     # Provided helpers — subclasses may use or override                   #
     # ------------------------------------------------------------------ #

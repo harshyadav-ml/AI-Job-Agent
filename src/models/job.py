@@ -244,6 +244,15 @@ class Job(BaseModel):
         ge=0,
         description="Parsed upper bound of salary range.",
     )
+    experience_raw: Optional[str] = Field(
+        default=None,
+        description="Raw experience string from scraper (e.g. '0-2 Yrs', '3+ years').",
+    )
+    max_experience_required: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Maximum years of experience required (upper bound parsed as integer).",
+    )
     tags: list[str] = Field(default_factory=list)
     posted_date: Optional[str] = Field(
         default=None,
@@ -278,6 +287,8 @@ class Job(BaseModel):
                 data["salary"] = data["salary_raw"]
             elif "salary" in data and not data.get("salary_raw"):
                 data["salary_raw"] = data["salary"]
+            if "min_experience" in data and "max_experience_required" not in data:
+                data["max_experience_required"] = data.pop("min_experience")
         return data
 
     @field_validator("title", "company", "location", "description", mode="before")
@@ -406,6 +417,15 @@ class Job(BaseModel):
             object.__setattr__(self, "job_id", hashlib.sha256(sig.encode()).hexdigest()[:16])
 
     # ------------------------------------------------------------------ #
+    # Compatibility properties                                             #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def min_experience(self) -> Optional[int]:
+        """Backward-compatible alias for max_experience_required."""
+        return self.max_experience_required
+
+    # ------------------------------------------------------------------ #
     # Serialisation                                                        #
     # ------------------------------------------------------------------ #
 
@@ -417,6 +437,8 @@ class Job(BaseModel):
             "location": self.location,
             "description": self.description,
             "salary": self.salary or self.salary_raw or "",
+            "experience_raw": self.experience_raw or "",
+            "max_experience_required": self.max_experience_required if self.max_experience_required is not None else "",
             "url": self.url,
             "posted_date": self.posted_date or "",
             "job_type": self.job_type,
@@ -427,6 +449,7 @@ class Job(BaseModel):
             base.update({
                 "salary_min": self.salary_min,
                 "salary_max": self.salary_max,
+                "max_experience_required": self.max_experience_required,
                 "tags": ", ".join(self.tags),
                 "job_id": self.job_id,
                 "company_logo": self.company_logo or "",

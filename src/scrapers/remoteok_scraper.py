@@ -101,6 +101,69 @@ class RemoteOKScraper(BaseScraper):
             self.logger.error("[remoteok] scrape failed: %s", exc, exc_info=True)
             return []
 
+    async def fetch_full_description(self, url: str) -> str:
+        """
+        Fetch full job description by making an async HTTP request to the job URL.
+
+        Extracts the entire body text from the main job content container rather than
+        relying on a single rigid CSS class. This handles diverse heading structures
+        like "About the role", "Roles and Responsibilities", "Requirements".
+        """
+        if not url:
+            return ""
+
+        headers = build_request_headers(
+            referer="https://remoteok.com/",
+            extra={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+        )
+        try:
+            async with httpx.AsyncClient(timeout=settings.TIMEOUT, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200 and resp.text:
+                    return self._extract_body_text(resp.text)
+        except Exception as exc:
+            self.logger.warning("[remoteok] fetch_full_description failed for %s: %s", url, exc)
+
+        return ""
+
+    @staticmethod
+    def _extract_body_text(html: str) -> str:
+        """
+        Extract clean full-body text from a RemoteOK job detail page.
+
+        Strategy: cascading selector waterfall from most specific to broadest,
+        stripping nav/header/footer noise. Returns cleaned newline-delimited text.
+        """
+        if not html:
+            return ""
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Remove noisy chrome elements before extracting
+        for tag in soup.select("nav, header, footer, script, style, [class*='apply'], [class*='sidebar'], [class*='social']"):
+            tag.decompose()
+
+        # Ordered waterfall: most-specific first
+        candidates = [
+            "div.description",
+            "td.description",
+            "div[class*='description']",
+            "div.markdown",
+            ".job-description",
+            "article",
+            "main",
+            "body",
+        ]
+        for sel in candidates:
+            el = soup.select_one(sel)
+            if el:
+                text = el.get_text(separator="\n", strip=True)
+                # Collapse blank lines but preserve paragraph breaks
+                text = re.sub(r"\n{3,}", "\n\n", text).strip()
+                if len(text) > 80:
+                    return text
+
+        return ""
+
     # ------------------------------------------------------------------ #
     # Synchronous scraping pipeline                                        #
     # ------------------------------------------------------------------ #
@@ -318,6 +381,20 @@ class RemoteOKScraper(BaseScraper):
 
         url = job_data.get("url") or job_data.get("apply_url") or ""
 
+        # Extract experience from badges / tags if available
+        experience_raw: Optional[str] = None
+        for tag in job_data.get("tags") or []:
+            tag_str = str(tag).strip()
+            if re.search(r"\b(\d+[\s\-\+to]*\d*\s*(?:yrs?|years?))\b", tag_str, re.IGNORECASE):
+                experience_raw = tag_str
+                break
+            elif tag_str.lower() in ("junior", "entry level", "entry-level", "intern", "internship"):
+                experience_raw = tag_str
+                break
+            elif tag_str.lower() in ("senior", "lead", "staff", "principal"):
+                experience_raw = tag_str
+                break
+
         return Job(
             title=job_data.get("position", ""),
             company=job_data.get("company", ""),
@@ -327,6 +404,7 @@ class RemoteOKScraper(BaseScraper):
             salary_raw=salary_str if salary_str != "Not specified" else None,
             salary_min=sal_min,
             salary_max=sal_max,
+            experience_raw=experience_raw,
             url=url,
             posted_date=posting_date,
             job_type=job_type,

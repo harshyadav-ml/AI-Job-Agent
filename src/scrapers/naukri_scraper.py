@@ -143,6 +143,157 @@ class NaukriScraper(BaseScraper):
             self.logger.error("[naukri] scrape failed: %s", exc, exc_info=True)
             return []
 
+    async def fetch_full_description(self, url: str) -> str:
+        """
+        Fetch full job description text from the Naukri JD detail page.
+
+        Targets .job-desc, .dang-inner-html, or .styles_JDC__dang-inner-html containers.
+        Uses WAF evasion headers with async Playwright fallback.
+        """
+        if not url:
+            return ""
+
+        if not url.startswith("http"):
+            url = urljoin(self.base_url, url)
+
+        # 1. Fast HTTP request using WAF evasion headers
+        try:
+            headers = {
+                "User-Agent": get_random_ua(),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.naukri.com/",
+                "appid": "109",
+                "systemid": "naukri",
+                "clientid": getattr(settings, "NAUKRI_CLIENT_ID", "d3Wh4DeBn0q20"),
+            }
+            async with httpx.AsyncClient(timeout=settings.TIMEOUT, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200 and resp.text:
+                    text = self._extract_jd_from_html(resp.text)
+                    if text and len(text) > 40:
+                        return text
+        except Exception as exc:
+            self.logger.debug("[naukri] HTTP fetch_full_description failed: %s", exc)
+
+        # 2. Browser fallback via async Playwright (if available)
+        if _PLAYWRIGHT_AVAILABLE:
+            try:
+                async with async_playwright() as playwright:
+                    browser = await playwright.chromium.launch(
+                        headless=True,
+                        args=[
+                            "--disable-blink-features=AutomationControlled",
+                            "--no-sandbox",
+                            "--disable-dev-shm-usage",
+                        ],
+                    )
+                    context = await browser.new_context(
+                        user_agent=get_random_ua(),
+                        viewport={"width": 1280, "height": 800},
+                    )
+                    page = await context.new_page()
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=self.browser_timeout)
+                        jd_selector = (
+                            ".styles_JDC__dang-inner-html, .dang-inner-html, .job-desc, "
+                            "section[class*='styles_job-desc-container'], [class*='job-desc']"
+                        )
+                        try:
+                            await page.wait_for_selector(jd_selector, timeout=8000)
+                        except Exception:
+                            pass
+
+                        content = await page.content()
+                        text = self._extract_jd_from_html(content)
+                        if text and len(text) > 40:
+                            return text
+                    finally:
+                        await context.close()
+                        await browser.close()
+            except Exception as pw_exc:
+                self.logger.warning("[naukri] async playwright JD scrape failed: %s", pw_exc)
+
+        # 3. Synchronous undetected-chromedriver fallback in thread (if uc available)
+        if _UC_AVAILABLE:
+            try:
+                text = await asyncio.to_thread(self._fetch_jd_with_uc, url)
+                if text and len(text) > 40:
+                    return text
+            except Exception as uc_exc:
+                self.logger.debug("[naukri] UC JD scrape fallback failed: %s", uc_exc)
+
+        return ""
+
+    def _extract_jd_from_html(self, html: str) -> str:
+        """
+        Extract clean full-body text from a Naukri job detail page.
+
+        Tries known Naukri JD selectors first (most specific), then falls back
+        to the page <main> / <article> to capture all content regardless of
+        heading structure ("About the role", "Requirements", etc.).
+        """
+        if not html:
+            return ""
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Remove noisy chrome elements
+        for tag in soup.select("nav, header, footer, script, style, [class*='apply'], [class*='sidebar']"):
+            tag.decompose()
+
+        # Ordered waterfall: Naukri-specific → generic semantic
+        candidates = [
+            ".styles_JDC__dang-inner-html",
+            ".dang-inner-html",
+            ".job-desc",
+            "[class*='styles_JDC__dang-inner-html']",
+            "section.styles_job-desc-container",
+            "[class*='job-desc-container']",
+            "div[class*='job-description']",
+            "[class*='jd-container']",
+            "main",
+            "article",
+        ]
+        for sel in candidates:
+            el = soup.select_one(sel)
+            if el:
+                text = el.get_text(separator="\n", strip=True)
+                text = re.sub(r"\n{3,}", "\n\n", text).strip()
+                if len(text) > 80:
+                    return text
+
+        return ""
+
+    def _fetch_jd_with_uc(self, url: str) -> str:
+        """Fetch JD HTML using undetected-chromedriver if needed."""
+        driver = None
+        try:
+            options = uc.ChromeOptions()
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            driver = uc.Chrome(options=options, headless=True)
+            driver.get(url)
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((
+                        By.CSS_SELECTOR,
+                        ".styles_JDC__dang-inner-html, .dang-inner-html, .job-desc"
+                    ))
+                )
+            except Exception:
+                pass
+            return self._extract_jd_from_html(driver.page_source)
+        except Exception as exc:
+            self.logger.debug("[naukri] _fetch_jd_with_uc failed: %s", exc)
+            return ""
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
     # ------------------------------------------------------------------ #
     # Synchronous scraping pipeline                                        #
     # ------------------------------------------------------------------ #
@@ -431,6 +582,11 @@ class NaukriScraper(BaseScraper):
         placeholders = item.get("placeholders") or []
         location = self._extract_placeholder(placeholders, "location") or fallback_location.title()
         salary = item.get("salary") or self._extract_placeholder(placeholders, "salary")
+        experience_raw = (
+            self._extract_placeholder(placeholders, "experience")
+            or item.get("experience")
+            or ""
+        )
         url = item.get("jdURL") or item.get("staticUrl") or ""
         if not url and item.get("jobId"):
             url = f"/job-listings-{item['jobId']}"
@@ -442,6 +598,7 @@ class NaukriScraper(BaseScraper):
             salary=salary or "Not specified",
             url=url,
             posted_date=item.get("createdDate") or "",
+            experience_raw=experience_raw,
         )
 
     def _build_search_url(self, keyword: str, location: str) -> str:
@@ -489,6 +646,9 @@ class NaukriScraper(BaseScraper):
         company = self._clean_company_name(
             self._extract_text(card, ["a.comp-name", "div.row2 span a", ".company-name a", "a[class*='comp-name']"])
         )
+        experience_raw = self._extract_text(
+            card, ["span.exp-wrap", ".experience span", "span.exp", "span[class*='exp']", "div.row3 span.exp-wrap"]
+        )
         return self._make_job(
             title=title,
             company=company or "N/A",
@@ -497,6 +657,7 @@ class NaukriScraper(BaseScraper):
             salary=self._extract_text(card, ["span.sal-wrap", ".salary span", "span[class*='sal']"]),
             url=self._extract_attribute(card, ["a.title", "div.row1 a", "h2 a", "a[class*='title']"], "href"),
             posted_date=self._extract_text(card, ["span.job-post-day", ".posting-date", "span[class*='date']"]),
+            experience_raw=experience_raw,
         )
 
     def _parse_rendered_card(self, card: Any) -> Optional[Job]:
@@ -504,14 +665,18 @@ class NaukriScraper(BaseScraper):
         if not title:
             return None
         description = self._locator_text(card, [".job-description", ".description"])
+        experience_raw = self._locator_text(
+            card, ["span.exp-wrap", ".experience span", "span.exp", "span[class*='exp']"]
+        )
         return self._make_job(
             title=title,
             company=self._locator_text(card, ["a.comp-name", "div.row2 span a", ".company-name a"]),
             location=self._locator_text(card, ["span.loc-wrap", ".location span", ".job-location"]),
-            description=description or self._locator_text(card, ["span.exp-wrap", ".experience span"]),
+            description=description,
             salary=self._locator_text(card, ["span.sal-wrap", ".salary span"]),
             url=self._locator_attribute(card, ["a.title", "div.row1 a"], "href"),
             posted_date=self._locator_text(card, ["span.job-post-day", ".posting-date"]),
+            experience_raw=experience_raw,
         )
 
     def _make_job(
@@ -523,10 +688,12 @@ class NaukriScraper(BaseScraper):
         salary: str,
         url: str,
         posted_date: str,
+        experience_raw: Optional[str] = None,
     ) -> Job:
         job_type = "Internship" if "intern" in f"{title} {description}".lower() else "Full-time"
         full_url = urljoin(self.base_url, url)
         salary_fmt = self._format_salary(salary)
+        exp_clean = experience_raw.strip() if experience_raw and str(experience_raw).strip() else None
         return Job(
             title=title,
             company=company,
@@ -534,6 +701,7 @@ class NaukriScraper(BaseScraper):
             description=description,
             salary=salary_fmt,
             salary_raw=salary_fmt if salary_fmt != "Not specified" else None,
+            experience_raw=exp_clean,
             url=full_url,
             posted_date=self._format_date(posted_date),
             job_type=job_type,

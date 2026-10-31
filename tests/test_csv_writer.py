@@ -73,7 +73,7 @@ def test_csv_header_is_first_line_and_properly_escaped(tmp_path: Path):
 
     # The header MUST be the first line, no empty lines or metadata comments
     first_line = lines[0].strip()
-    assert first_line == "title,company,location,description,salary,url,posted_date,job_type,source,scraped_at"
+    assert first_line == "title,company,location,description,salary,experience_raw,max_experience_required,url,posted_date,job_type,source,scraped_at"
 
     # Verify second line contains properly escaped fields
     second_line = lines[1]
@@ -111,7 +111,7 @@ def test_write_jobs_pandas_exports_header_true_index_false(tmp_path: Path):
         first_line = f.readline().strip()
 
     # Must have header as first row and no index column (e.g. Unnamed: 0)
-    assert first_line == "title,company,location,description,salary,url,posted_date,job_type,source,scraped_at"
+    assert first_line == "title,company,location,description,salary,experience_raw,max_experience_required,url,posted_date,job_type,source,scraped_at"
     assert "Unnamed" not in first_line
 
     # Test reading back with read_jobs_df
