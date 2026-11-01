@@ -1,5 +1,13 @@
-"""Naukri scraper: undetected-chromedriver (primary) → HTTP/BeautifulSoup → Naukri REST API."""
+"""
+Naukri scraper: undetected-chromedriver (primary) → HTTP/BeautifulSoup → Naukri REST API.
 
+Supports both async execution for the concurrency orchestrator and backwards-compatible
+synchronous methods for unit and integration testing.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import logging
 import random
 import re
@@ -8,9 +16,9 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
+import httpx
 import requests
 from bs4 import BeautifulSoup, Tag
-from playwright.sync_api import Locator, sync_playwright
 
 try:
     import undetected_chromedriver as uc
@@ -22,13 +30,19 @@ except ImportError:
     _UC_AVAILABLE = False
 
 try:
+    from playwright.sync_api import Locator, sync_playwright
+    from playwright.async_api import async_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
+
+try:
     from playwright_stealth import stealth_sync
 except ImportError:
     try:
         from playwright_stealth import Stealth
 
         def stealth_sync(page):
-            """Apply stealth with the current playwright-stealth API."""
             Stealth().apply_stealth_sync(page)
     except ImportError:
         def stealth_sync(page):
@@ -36,14 +50,16 @@ except ImportError:
 
 from src.config import get_logger, settings
 from src.models import Job
+from src.models.job import parse_date
 from src.processors.query_parser import ParsedQuery, QueryParser
 from src.scrapers.base import BaseScraper
+from src.utils.ua_rotator import build_request_headers
 
 logger = logging.getLogger(__name__)
 
 
 class NaukriScraper(BaseScraper):
-    """Scrape Naukri jobs while tolerating API and bot-protection failures."""
+    """Scrape Naukri jobs with multi-tier anti-bot and API fallback."""
 
     USER_AGENT = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -51,37 +67,85 @@ class NaukriScraper(BaseScraper):
         "Chrome/128.0.0.0 Safari/537.36"
     )
     API_URL = "https://www.naukri.com/jobapi/v3/search"
-    API_HEADERS = {
-        "User-Agent": USER_AGENT,
-        "appid": "109",
-        "systemid": "109",
-        "clientid": "d3Wh4DeBn0q20",
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
     JOB_CARD_SELECTORS = (
         "article.jobTuple, div.srp-jobtuple-wrapper, div.cust-job-tuple, "
         "div[data-job-id], [class*='styles_job-listing-container']"
     )
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.logger = get_logger(__name__)
         self.base_url = "https://www.naukri.com"
+        self._BASE_URL = self.base_url
+        self._API_URL = self.API_URL
         self.query_parser = QueryParser()
+
+        # Dynamic credentials from settings (no hardcoding)
+        self.API_HEADERS = {
+            "User-Agent": self.USER_AGENT,
+            "appid": getattr(settings, "NAUKRI_APP_ID", "109"),
+            "systemid": getattr(settings, "NAUKRI_SYSTEM_ID", "109"),
+            "clientid": getattr(settings, "NAUKRI_CLIENT_ID", "d3Wh4DeBn0q20"),
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
         self.session = requests.Session()
         self.session.headers.update(self.API_HEADERS)
+
         self.request_delay = getattr(settings, "REQUEST_DELAY", 2.0)
+        self._request_delay = self.request_delay
         self.last_request_time = 0.0
         self.max_pages = 1
+
         timeout_sec = int(getattr(settings, "BROWSER_TIMEOUT", 30))
         self.browser_timeout = timeout_sec * 1000 if timeout_sec < 1000 else timeout_sec
+        self._browser_timeout_ms = self.browser_timeout
+
+    # ------------------------------------------------------------------ #
+    # BaseScraper interface                                                #
+    # ------------------------------------------------------------------ #
 
     @property
     def source_name(self) -> str:
         return "naukri"
 
+    async def health_check(self) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.head(
+                    self.base_url,
+                    headers=build_request_headers(),
+                    follow_redirects=True,
+                )
+                return r.status_code < 500
+        except Exception as exc:
+            self.logger.warning("[naukri] health_check failed: %s", exc)
+            return False
+
+    async def scrape(
+        self,
+        keywords: list[str],
+        locations: list[str],
+        *,
+        max_results: int = 50,
+    ) -> list[Job]:
+        """Async scrape entry point used by main.py concurrency orchestrator."""
+        self.logger.info(
+            "[naukri] scrape started — keywords=%s locations=%s", keywords, locations
+        )
+        try:
+            jobs = await asyncio.to_thread(self.scrape_jobs, keywords, locations)
+            return jobs[:max_results]
+        except Exception as exc:
+            self.logger.error("[naukri] scrape failed: %s", exc, exc_info=True)
+            return []
+
+    # ------------------------------------------------------------------ #
+    # Synchronous scraping pipeline                                        #
+    # ------------------------------------------------------------------ #
+
     def scrape_jobs(self, keywords: List[str], locations: List[str]) -> List[Job]:
-        """Scrape Naukri search pages through the stealth browser with fallback."""
+        """Scrape Naukri search pages through browser with fallbacks."""
         self.logger.info(
             "Starting Naukri scraping for keywords: %s, locations: %s",
             keywords,
@@ -98,11 +162,15 @@ class NaukriScraper(BaseScraper):
                     self.logger.info("Scraping Naukri search URL: %s", target_url)
                     jobs = self._scrape_with_browser(target_url)
                     if not jobs:
-                        self.logger.info("Browser returned no jobs; falling back to HTTP/BeautifulSoup parser for %s", target_url)
+                        self.logger.info(
+                            "Browser returned no jobs; falling back to HTTP parser for %s",
+                            target_url,
+                        )
                         jobs = self._scrape_with_http(target_url)
                     if not jobs:
                         self.logger.info(
-                            "HTTP fallback returned no jobs; invoking Naukri API fallback for %s", keyword
+                            "HTTP fallback returned no jobs; invoking Naukri API fallback for %s",
+                            keyword,
                         )
                         jobs = self._fetch_api_jobs(keyword, location)
                     all_jobs.extend(jobs)
@@ -111,17 +179,166 @@ class NaukriScraper(BaseScraper):
         self.logger.info("Found %d unique jobs from Naukri", len(unique_jobs))
         return unique_jobs
 
-    def scrape(self, role: str, location: Optional[str] = None) -> List[Job]:
-        """Parse a natural-language query or role/location and scrape Naukri results."""
-        if location:
-            return self.scrape_jobs([role], [location])
-        parsed_query = self.query_parser.parse(role)
-        if parsed_query.locations:
-            return self.scrape_jobs([parsed_query.keywords], parsed_query.locations)
-        return self.scrape_jobs([role], [])
+    def _scrape_with_browser(self, url: str) -> List[Job]:
+        """Render search URL with undetected-chromedriver and parse cards."""
+        if not _UC_AVAILABLE:
+            self.logger.warning("undetected-chromedriver not installed; skipping browser scrape")
+            return []
+
+        driver = None
+        try:
+            options = uc.ChromeOptions()
+            options.add_argument("--no-sandbox")
+            options.add_argument("--window-size=1440,900")
+            options.add_argument("--disable-dev-shm-usage")
+
+            self._rate_limit()
+            # Let undetected-chromedriver auto-detect the installed Chrome version
+            driver = uc.Chrome(options=options, headless=False)
+            driver.get(url)
+
+            card_css = "#listContainer, div.srp-jobtuple-wrapper, div[data-job-id], article.jobTuple"
+            try:
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, card_css))
+                )
+            except Exception as wait_exc:
+                self.logger.warning("UC wait timed out: %s; parsing available DOM", wait_exc)
+
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            cards = self._find_job_cards(soup)
+            jobs = []
+            for card in cards:
+                job = self._parse_job_card(card)
+                if job and job.title:
+                    jobs.append(job)
+
+            if jobs:
+                self.logger.info("undetected-chromedriver parsed %d jobs from %s", len(jobs), url)
+            return jobs
+
+        except Exception as exc:
+            self.logger.warning("undetected-chromedriver failed (%s); falling back", exc)
+            return []
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    def _scrape_page(self, page: Any, url: str) -> List[Job]:
+        """Navigate to rendered page and parse cards, with BeautifulSoup fallback."""
+        self._rate_limit()
+        page.goto(url, wait_until="domcontentloaded", timeout=self.browser_timeout)
+        try:
+            page.evaluate("window.scrollBy(0, 500)")
+        except Exception:
+            pass
+
+        card_selector = ".cust-job-tuple, [data-job-id], .srp-jobtuple-wrapper, div.row1"
+        try:
+            page.wait_for_selector(card_selector, timeout=self.browser_timeout)
+            cards = page.locator(card_selector)
+            jobs = []
+            for index in range(cards.count()):
+                job = self._parse_rendered_card(cards.nth(index))
+                if job and job.title:
+                    jobs.append(job)
+            if jobs:
+                return jobs
+        except Exception as wait_exc:
+            self.logger.warning("Playwright wait timed out (%s); falling back to BeautifulSoup", wait_exc)
+
+        try:
+            html = page.content() if hasattr(page, "content") else ""
+            if html:
+                soup = BeautifulSoup(html, "html.parser")
+                cards = self._find_job_cards(soup)
+                jobs = []
+                for card in cards:
+                    job = self._parse_job_card(card)
+                    if job and job.title:
+                        jobs.append(job)
+                if jobs:
+                    return jobs
+        except Exception as parse_exc:
+            self.logger.warning("BeautifulSoup page fallback failed: %s", parse_exc)
+
+        return []
+
+    def _scrape_with_http(self, url: str) -> List[Job]:
+        """Fetch static HTML via requests session and parse job cards."""
+        try:
+            self._rate_limit()
+            headers = {
+                "User-Agent": self.USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.google.com/",
+            }
+            response = self.session.get(url, headers=headers, timeout=settings.TIMEOUT)
+            if response.status_code == 200 and response.text:
+                soup = BeautifulSoup(response.text, "html.parser")
+                cards = self._find_job_cards(soup)
+                jobs = []
+                for card in cards:
+                    job = self._parse_job_card(card)
+                    if job and job.title:
+                        jobs.append(job)
+                if jobs:
+                    self.logger.info("HTTP/BeautifulSoup parser found %d jobs from %s", len(jobs), url)
+                    return jobs
+        except Exception as exc:
+            self.logger.warning("HTTP scrape failed for %s: %s", url, exc)
+        return []
+
+    def _fetch_html_with_retry(self, url: str, retries: int = 2) -> Optional[str]:
+        """Fetch HTML with retries, falling back to sync Playwright browser."""
+        for attempt in range(retries):
+            try:
+                self._rate_limit()
+                response = self.session.get(url, timeout=settings.TIMEOUT)
+                if response.status_code == 200 and response.text:
+                    return response.text
+                self.logger.warning("Naukri HTML request returned HTTP %s", response.status_code)
+            except requests.RequestException as exc:
+                self.logger.warning("Naukri HTML attempt %d failed: %s", attempt + 1, exc)
+            if attempt < retries - 1:
+                time.sleep(1)
+
+        if not _PLAYWRIGHT_AVAILABLE:
+            return None
+
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-dev-shm-usage",
+                        "--no-sandbox",
+                    ],
+                )
+                context = browser.new_context(
+                    user_agent=self.USER_AGENT,
+                    viewport={"width": 1366, "height": 768},
+                    locale="en-US",
+                )
+                page = context.new_page()
+                stealth_sync(page)
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=self.browser_timeout)
+                    return page.content()
+                finally:
+                    context.close()
+                    browser.close()
+        except Exception as exc:
+            self.logger.warning("Naukri browser HTML fallback failed: %s", exc)
+            return None
 
     def _fetch_api_jobs(self, keyword: str, location: str) -> List[Job]:
-        """Fetch one Naukri API response and map its jobDetails."""
+        """Fetch listings via internal Naukri REST API."""
         params = {
             "noOfResults": 20,
             "urlType": "search_by_keyword",
@@ -171,196 +388,6 @@ class NaukriScraper(BaseScraper):
             posted_date=item.get("createdDate") or "",
         )
 
-    def _scrape_with_browser(self, url: str) -> List[Job]:
-        """Render one search URL with undetected-chromedriver and parse cards via BeautifulSoup.
-
-        Falls back cleanly to the HTTP/BeautifulSoup parser if UC is unavailable or
-        the driver raises any exception.
-        """
-        if not _UC_AVAILABLE:
-            self.logger.warning("undetected-chromedriver not installed; skipping browser scrape")
-            return []
-
-        driver = None
-        try:
-            options = uc.ChromeOptions()
-            options.add_argument("--no-sandbox")
-            options.add_argument("--window-size=1440,900")
-            options.add_argument("--disable-dev-shm-usage")
-
-            self._rate_limit()
-            driver = uc.Chrome(version_main=153, options=options, headless=False)
-            driver.get(url)
-
-            # Allow Cloudflare clearance to finish and React root to render
-            time.sleep(5)
-
-            # Attempt an immediate parse on whatever is already rendered
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-            cards = self._find_job_cards(soup)
-            jobs = []
-            for card in cards:
-                job = self._parse_job_card(card)
-                if job and job.title:
-                    jobs.append(job)
-            if jobs:
-                self.logger.info(
-                    "undetected-chromedriver early-parse found %d jobs from %s", len(jobs), url
-                )
-                return jobs
-
-            # No cards yet — wait for the job list to appear and try once more
-            card_css = "#listContainer, div.srp-jobtuple-wrapper, div[data-job-id]"
-            try:
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, card_css))
-                )
-            except Exception as wait_exc:
-                self.logger.warning(
-                    "UC wait_for_element timed out (%s); parsing whatever was rendered",
-                    wait_exc,
-                )
-
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-            cards = self._find_job_cards(soup)
-            jobs = []
-            for card in cards:
-                job = self._parse_job_card(card)
-                if job and job.title:
-                    jobs.append(job)
-
-            if jobs:
-                self.logger.info(
-                    "undetected-chromedriver parsed %d jobs from %s", len(jobs), url
-                )
-            return jobs
-
-        except Exception as exc:
-            self.logger.warning(
-                "undetected-chromedriver failed (%s); falling back to HTTP/BeautifulSoup parser",
-                exc,
-            )
-            return []
-        finally:
-            if driver is not None:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-
-    def _scrape_page(self, page: Any, url: str) -> List[Job]:
-        """Navigate to a rendered page and parse cards, falling back to BeautifulSoup if wait times out."""
-        self._rate_limit()
-        page.goto(url, wait_until="domcontentloaded", timeout=self.browser_timeout)
-        try:
-            page.evaluate("window.scrollBy(0, 500)")
-        except Exception:
-            try:
-                page.mouse.wheel(0, 500)
-            except Exception:
-                pass
-        card_selector = ".cust-job-tuple, [data-job-id], .srp-jobtuple-wrapper, div.row1"
-        try:
-            page.wait_for_selector(card_selector, timeout=self.browser_timeout)
-            cards = page.locator(card_selector)
-            jobs = []
-            for index in range(cards.count()):
-                job = self._parse_rendered_card(cards.nth(index))
-                if job and job.title:
-                    jobs.append(job)
-            if jobs:
-                return jobs
-        except Exception as wait_exc:
-            self.logger.warning(
-                "Naukri Playwright wait_for_selector timed out (%s); falling back to BeautifulSoup HTML parser on page content",
-                wait_exc,
-            )
-
-        # Clean fallback to BeautifulSoup on rendered page content
-        try:
-            html = page.content() if hasattr(page, "content") else ""
-            if html:
-                soup = BeautifulSoup(html, "html.parser")
-                cards = self._find_job_cards(soup)
-                jobs = []
-                for card in cards:
-                    job = self._parse_job_card(card)
-                    if job and job.title:
-                        jobs.append(job)
-                if jobs:
-                    self.logger.info("BeautifulSoup page fallback parsed %d jobs", len(jobs))
-                    return jobs
-        except Exception as parse_exc:
-            self.logger.warning("BeautifulSoup page content fallback failed: %s", parse_exc)
-
-        return []
-
-    def _scrape_with_http(self, url: str) -> List[Job]:
-        """Fetch static HTML with requests and parse job cards via BeautifulSoup."""
-        try:
-            self._rate_limit()
-            headers = {
-                "User-Agent": self.USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://www.google.com/",
-            }
-            response = self.session.get(url, headers=headers, timeout=settings.TIMEOUT)
-            if response.status_code == 200 and response.text:
-                soup = BeautifulSoup(response.text, "html.parser")
-                cards = self._find_job_cards(soup)
-                jobs = []
-                for card in cards:
-                    job = self._parse_job_card(card)
-                    if job and job.title:
-                        jobs.append(job)
-                if jobs:
-                    self.logger.info("HTTP/BeautifulSoup parser parsed %d jobs from %s", len(jobs), url)
-                    return jobs
-        except Exception as exc:
-            self.logger.warning("HTTP/BeautifulSoup scrape failed for %s: %s", url, exc)
-        return []
-
-    def _fetch_html_with_retry(self, url: str, retries: int = 2) -> Optional[str]:
-        """Fetch static HTML with retries, then use a browser page if blocked."""
-        for attempt in range(retries):
-            try:
-                self._rate_limit()
-                response = self.session.get(url, timeout=settings.TIMEOUT)
-                if response.status_code == 200 and response.text:
-                    return response.text
-                self.logger.warning("Naukri HTML request returned HTTP %s", response.status_code)
-            except requests.RequestException as exc:
-                self.logger.warning("Naukri HTML attempt %d failed: %s", attempt + 1, exc)
-            if attempt < retries - 1:
-                time.sleep(1)
-        try:
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--disable-dev-shm-usage",
-                        "--no-sandbox",
-                    ],
-                )
-                context = browser.new_context(
-                    user_agent=self.USER_AGENT,
-                    viewport={"width": 1366, "height": 768},
-                    locale="en-US",
-                )
-                page = context.new_page()
-                stealth_sync(page)
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=self.browser_timeout)
-                    return page.content()
-                finally:
-                    context.close()
-                    browser.close()
-        except Exception as exc:
-            self.logger.warning("Naukri browser HTML fallback failed: %s", exc)
-            return None
-
     def _build_search_url(self, keyword: str, location: str) -> str:
         role_slug = self.query_parser.role_slug(keyword)
         location_slug = self.query_parser.location_slug(location)
@@ -374,21 +401,6 @@ class NaukriScraper(BaseScraper):
             for keyword in keywords[:2]
             for location in (locations[:2] if locations else [""])
         ]
-
-    def _parse_rendered_card(self, card: Any) -> Optional[Job]:
-        title = self._locator_text(card, ["a.title", "div.row1 a", "h2 a", ".job-title a"])
-        if not title:
-            return None
-        description = self._locator_text(card, [".job-description", ".description"])
-        return self._make_job(
-            title=title,
-            company=self._locator_text(card, ["a.comp-name", "div.row2 span a", ".company-name a"]),
-            location=self._locator_text(card, ["span.loc-wrap", ".location span", ".job-location"]),
-            description=description or self._locator_text(card, ["span.exp-wrap", ".experience span"]),
-            salary=self._locator_text(card, ["span.sal-wrap", ".salary span"]),
-            url=self._locator_attribute(card, ["a.title", "div.row1 a"], "href"),
-            posted_date=self._locator_text(card, ["span.job-post-day", ".posting-date"]),
-        )
 
     def _find_job_cards(self, soup: BeautifulSoup) -> List[Tag]:
         for selector in [
@@ -416,7 +428,9 @@ class NaukriScraper(BaseScraper):
         if not title:
             return None
         description = self._extract_text(card, [".job-description", ".description"])
-        company = self._clean_company_name(self._extract_text(card, ["a.comp-name", "div.row2 span a", ".company-name a"]))
+        company = self._clean_company_name(
+            self._extract_text(card, ["a.comp-name", "div.row2 span a", ".company-name a"])
+        )
         return self._make_job(
             title=title,
             company=company or "N/A",
@@ -425,6 +439,21 @@ class NaukriScraper(BaseScraper):
             salary=self._extract_text(card, ["span.sal-wrap", ".salary span"]),
             url=self._extract_attribute(card, ["a.title", "div.row1 a"], "href"),
             posted_date=self._extract_text(card, ["span.job-post-day", ".posting-date"]),
+        )
+
+    def _parse_rendered_card(self, card: Any) -> Optional[Job]:
+        title = self._locator_text(card, ["a.title", "div.row1 a", "h2 a", ".job-title a"])
+        if not title:
+            return None
+        description = self._locator_text(card, [".job-description", ".description"])
+        return self._make_job(
+            title=title,
+            company=self._locator_text(card, ["a.comp-name", "div.row2 span a", ".company-name a"]),
+            location=self._locator_text(card, ["span.loc-wrap", ".location span", ".job-location"]),
+            description=description or self._locator_text(card, ["span.exp-wrap", ".experience span"]),
+            salary=self._locator_text(card, ["span.sal-wrap", ".salary span"]),
+            url=self._locator_attribute(card, ["a.title", "div.row1 a"], "href"),
+            posted_date=self._locator_text(card, ["span.job-post-day", ".posting-date"]),
         )
 
     def _make_job(
@@ -438,13 +467,16 @@ class NaukriScraper(BaseScraper):
         posted_date: str,
     ) -> Job:
         job_type = "Internship" if "intern" in f"{title} {description}".lower() else "Full-time"
+        full_url = urljoin(self.base_url, url)
+        salary_fmt = self._format_salary(salary)
         return Job(
             title=title,
             company=company,
-            location=location,
+            location=location or "Not specified",
             description=description,
-            salary=self._format_salary(salary),
-            url=urljoin(self.base_url, url),
+            salary=salary_fmt,
+            salary_raw=salary_fmt if salary_fmt != "Not specified" else None,
+            url=full_url,
             posted_date=self._format_date(posted_date),
             job_type=job_type,
             source="naukri",
@@ -507,20 +539,10 @@ class NaukriScraper(BaseScraper):
     def _format_date(self, value: str) -> str:
         if not value:
             return ""
-        normalized = value.strip().lower()
-        match = re.search(r"(\d+)\s+(day|hour|week|month)", normalized)
-        if "ago" in normalized and match:
-            amount = int(match.group(1))
-            units = {"day": amount, "hour": amount / 24, "week": amount * 7, "month": amount * 30}
-            return (datetime.now() - timedelta(days=units[match.group(2)])).strftime("%Y-%m-%d")
-        for date_format in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-            try:
-                return datetime.strptime(normalized, date_format).strftime("%Y-%m-%d")
-            except ValueError:
-                pass
-        return value
+        parsed = parse_date(value)
+        return parsed or value
 
-    def _rate_limit(self):
+    def _rate_limit(self) -> None:
         if self.request_delay <= 0:
             self.last_request_time = time.time()
             return
@@ -534,7 +556,7 @@ class NaukriScraper(BaseScraper):
         seen = set()
         unique = []
         for job in jobs:
-            key = f"{job.title.lower()}|{job.company.lower()}|{job.location.lower()}"
+            key = job.job_id or f"{job.title.lower()}|{job.company.lower()}|{job.location.lower()}"
             if key not in seen:
                 seen.add(key)
                 unique.append(job)

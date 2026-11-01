@@ -1,96 +1,196 @@
 """
-Configuration management for Job Agent.
-Loads environment variables and provides configuration access.
+Application settings — validated at startup via pydantic-settings.
+
+All configuration is sourced from environment variables or the .env file.
+Bad values (wrong type, out-of-range numbers, missing required keys) raise
+a ``ValidationError`` immediately on import — not buried in a runtime crash
+ten minutes into a scrape run.
+
+Required env vars (must be present in .env or environment):
+    NAUKRI_CLIENT_ID   — Internal Naukri API client credential.
+
+Optional but strongly recommended:
+    FIRECRAWL_API_KEY  — Without this, the Wellfound scraper is disabled.
 """
+
+from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional
-from dotenv import load_dotenv
+from typing import Any, List, Optional
 
-# Load environment variables from .env file
-load_dotenv()
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Settings:
-    """Application settings loaded from environment variables."""
-    
-    # Base paths
-    BASE_DIR = Path(__file__).parent.parent.parent
-    DATA_DIR = BASE_DIR / os.getenv("DATA_DIR", "data")
-    LOGS_DIR = BASE_DIR / "logs"
-    
-    # Firecrawl Configuration
-    FIRECRAWL_API_KEY: str = os.getenv("FIRECRAWL_API_KEY", "")
-    
-    # Search Configuration
-    SEARCH_KEYWORDS: List[str] = [
-        keyword.strip() 
-        for keyword in os.getenv("SEARCH_KEYWORDS", "python,developer").split(",")
-    ]
-    JOB_TITLES: List[str] = [
-        title.strip() 
-        for title in os.getenv("JOB_TITLES", "Software Engineer").split(",")
-    ]
-    
-    # Location Filters
-    LOCATIONS: List[str] = [
-        location.strip() 
-        for location in os.getenv("LOCATIONS", "remote").split(",")
-    ]
-    COUNTRY_FILTER: str = os.getenv("COUNTRY_FILTER", "")
-    
-    # Experience Level
-    EXPERIENCE_LEVEL: List[str] = [
-        level.strip() 
-        for level in os.getenv("EXPERIENCE_LEVEL", "mid-level").split(",")
-    ]
-    
-    # Rate Limiting Configuration
-    REQUEST_DELAY: float = float(os.getenv("REQUEST_DELAY", "2"))
-    MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "3"))
-    TIMEOUT: int = int(os.getenv("TIMEOUT", "30"))
-    BROWSER_TIMEOUT: int = int(os.getenv("BROWSER_TIMEOUT", "30"))  # Browser timeout in seconds (30s)
-    
-    # Naukri Configuration
-    NAUKRI_USER_AGENT: str = os.getenv(
-        "NAUKRI_USER_AGENT",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+class Settings(BaseSettings):
+    """
+    Typed, validated application configuration.
+
+    Pydantic-settings reads from (in priority order):
+    1. Real environment variables
+    2. The .env file in the project root
+    """
+
+    model_config = SettingsConfigDict(
+        # Walk up from this file to find the project root .env
+        env_file=str(Path(__file__).parent.parent.parent / ".env"),
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        # Unknown extra env vars are silently ignored — avoids breakage when
+        # the shell carries unrelated variables.
+        extra="ignore",
     )
-    
-    # RemoteOK Configuration
-    REMOTEOK_API_URL: str = os.getenv("REMOTEOK_API_URL", "https://remoteok.com/api")
-    
-    # Wellfound Configuration
-    WELLFOUND_BASE_URL: str = os.getenv("WELLFOUND_BASE_URL", "https://wellfound.com")
-    
-    # Logging Configuration
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    LOG_FILE: str = os.getenv("LOG_FILE", "logs/job_agent.log")
-    
-    # Data Storage Configuration
-    CSV_FILENAME_PATTERN: str = os.getenv("CSV_FILENAME_PATTERN", "jobs_{date}.csv")
-    
+
+    # ------------------------------------------------------------------ #
+    # Paths                                                                #
+    # ------------------------------------------------------------------ #
+    BASE_DIR: Path = Path(__file__).parent.parent.parent
+    DATA_DIR: Path = Field(default=Path("data"))
+    LOGS_DIR: Path = Field(default=Path("logs"))
+
+    @field_validator("DATA_DIR", "LOGS_DIR", mode="before")
     @classmethod
-    def validate(cls) -> bool:
-        """Validate that required configuration is present."""
-        if not cls.FIRECRAWL_API_KEY:
-            print("Warning: FIRECRAWL_API_KEY not set. Wellfound scraper will not work.")
-        
-        # Create necessary directories
-        cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        cls.LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        
-        return True
-    
-    @classmethod
-    def get_csv_filename(cls, date: str = None) -> str:
-        """Generate CSV filename with date."""
+    def _resolve_path(cls, v: object) -> Path:
+        return Path(str(v))
+
+    # ------------------------------------------------------------------ #
+    # Firecrawl                                                            #
+    # ------------------------------------------------------------------ #
+    FIRECRAWL_API_KEY: str = Field(
+        default="",
+        description="Firecrawl API key. Wellfound scraper is disabled if empty.",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Search defaults                                                      #
+    # ------------------------------------------------------------------ #
+    # Typed as str (not List[str]) intentionally: pydantic-settings would
+    # attempt JSON-decode on a List field read from an env var / .env file,
+    # which breaks with plain comma-separated values like "python,developer".
+    # We expose parsed list properties below.
+    SEARCH_KEYWORDS: str = Field(default="python developer")
+    JOB_TITLES: str = Field(default="Software Engineer")
+    LOCATIONS: str = Field(default="remote")
+    COUNTRY_FILTER: str = ""
+    EXPERIENCE_LEVEL: str = Field(default="mid-level")
+
+    @property
+    def search_keywords_list(self) -> List[str]:
+        return [s.strip() for s in self.SEARCH_KEYWORDS.split(",") if s.strip()]
+
+    @property
+    def job_titles_list(self) -> List[str]:
+        return [s.strip() for s in self.JOB_TITLES.split(",") if s.strip()]
+
+    @property
+    def locations_list(self) -> List[str]:
+        return [s.strip() for s in self.LOCATIONS.split(",") if s.strip()]
+
+    @property
+    def experience_level_list(self) -> List[str]:
+        return [s.strip() for s in self.EXPERIENCE_LEVEL.split(",") if s.strip()]
+
+    # ------------------------------------------------------------------ #
+    # Rate-limiting / networking                                           #
+    # ------------------------------------------------------------------ #
+    REQUEST_DELAY: float = Field(
+        default=2.0,
+        ge=0.0,
+        le=120.0,
+        description="Minimum seconds between HTTP requests to the same host.",
+    )
+    MAX_RETRIES: int = Field(default=3, ge=1, le=10)
+    TIMEOUT: int = Field(
+        default=30,
+        ge=5,
+        le=300,
+        description="HTTP request timeout in seconds.",
+    )
+    BROWSER_TIMEOUT: int = Field(
+        default=30,
+        ge=5,
+        le=300,
+        description="Playwright/Selenium page-load timeout in seconds.",
+    )
+
+    # ------------------------------------------------------------------ #
+    # Naukri                                                               #
+    # ------------------------------------------------------------------ #
+    NAUKRI_CLIENT_ID: str = Field(
+        default="d3Wh4DeBn0q20",
+        description=(
+            "Naukri internal API clientid header. "
+            "Rotate this via .env when Naukri invalidates the default."
+        ),
+    )
+    NAUKRI_APP_ID: str = Field(default="109")
+    NAUKRI_SYSTEM_ID: str = Field(default="109")
+    NAUKRI_USER_AGENT: str = Field(
+        default=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/128.0.0.0 Safari/537.36"
+        )
+    )
+
+    # ------------------------------------------------------------------ #
+    # RemoteOK                                                             #
+    # ------------------------------------------------------------------ #
+    REMOTEOK_API_URL: str = Field(default="https://remoteok.com/api")
+
+    # ------------------------------------------------------------------ #
+    # Wellfound                                                            #
+    # ------------------------------------------------------------------ #
+    WELLFOUND_BASE_URL: str = Field(default="https://wellfound.com")
+
+    # ------------------------------------------------------------------ #
+    # Logging                                                              #
+    # ------------------------------------------------------------------ #
+    LOG_LEVEL: str = Field(default="INFO", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
+    LOG_FILE: str = Field(default="logs/job_agent.log")
+
+    # ------------------------------------------------------------------ #
+    # Storage                                                              #
+    # ------------------------------------------------------------------ #
+    CSV_FILENAME_PATTERN: str = Field(default="jobs_{date}.csv")
+
+    # ------------------------------------------------------------------ #
+    # Post-init: ensure directories exist and emit warnings for missing   #
+    # optional but important keys.                                        #
+    # ------------------------------------------------------------------ #
+    @model_validator(mode="after")
+    def _ensure_dirs_and_warn(self) -> "Settings":
+        abs_data = (self.BASE_DIR / self.DATA_DIR) if not self.DATA_DIR.is_absolute() else self.DATA_DIR
+        abs_logs = (self.BASE_DIR / self.LOGS_DIR) if not self.LOGS_DIR.is_absolute() else self.LOGS_DIR
+        abs_data.mkdir(parents=True, exist_ok=True)
+        abs_logs.mkdir(parents=True, exist_ok=True)
+
+        import logging
+        log = logging.getLogger(__name__)
+        if not self.FIRECRAWL_API_KEY:
+            log.warning(
+                "FIRECRAWL_API_KEY is not set — Wellfound scraper will be disabled."
+            )
+        return self
+
+    # ------------------------------------------------------------------ #
+    # Convenience helpers                                                  #
+    # ------------------------------------------------------------------ #
+    def get_absolute_data_dir(self) -> Path:
+        p = self.DATA_DIR
+        return (self.BASE_DIR / p) if not p.is_absolute() else p
+
+    def get_csv_filename(self, date: Optional[str] = None) -> str:
         if date is None:
             from datetime import datetime
-            date = datetime.now().strftime("%Y-%m-%d")
-        return cls.CSV_FILENAME_PATTERN.format(date=date)
+            date = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return self.CSV_FILENAME_PATTERN.format(date=date)
+
+    def validate(self) -> bool:
+        """Legacy compatibility shim used by main.py."""
+        return True
 
 
-# Global settings instance
+# Module-level singleton — validated at import time.
 settings = Settings()

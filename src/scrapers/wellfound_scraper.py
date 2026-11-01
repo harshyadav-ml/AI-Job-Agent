@@ -1,15 +1,24 @@
-"""Wellfound scraper using Firecrawl with full unit test compatibility."""
+"""
+Wellfound scraper using Firecrawl with full unit test and async compatibility.
 
+Wellfound is a React SPA with Cloudflare protection. Firecrawl renders JavaScript
+and returns rendered DOM / markdown.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import logging
 import os
 import re
-from typing import Optional, List, Any
+from typing import Any, List, Optional
+
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+from src.config import settings
 from src.models import Job
 from src.scrapers.base import BaseScraper
-from ..config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -17,15 +26,42 @@ BASE_URL = "https://wellfound.com"
 
 
 class WellfoundScraper(BaseScraper):
+    """Scraper for Wellfound job board via Firecrawl managed-browser service."""
+
     def __init__(self, firecrawl: Optional[Any] = None) -> None:
-        load_dotenv()
-        self.api_key = os.environ.get("FIRECRAWL_API_KEY", "").strip() or getattr(settings, "FIRECRAWL_API_KEY", "")
+        self.api_key = getattr(settings, "FIRECRAWL_API_KEY", "") or os.environ.get("FIRECRAWL_API_KEY", "").strip()
         self._custom_firecrawl = firecrawl
         self._firecrawl_explicitly_set = firecrawl is not None
+
+    # ------------------------------------------------------------------ #
+    # BaseScraper interface                                                #
+    # ------------------------------------------------------------------ #
 
     @property
     def source_name(self) -> str:
         return "wellfound"
+
+    async def health_check(self) -> bool:
+        return bool(self.api_key or self._firecrawl_explicitly_set)
+
+    async def scrape(
+        self,
+        keywords: list[str],
+        locations: list[str],
+        *,
+        max_results: int = 50,
+    ) -> list[Job]:
+        """Async scrape entry point used by main.py concurrency orchestrator."""
+        try:
+            jobs = await asyncio.to_thread(self.scrape_jobs, keywords, locations)
+            return jobs[:max_results]
+        except Exception as exc:
+            logger.error("[wellfound] scrape failed: %s", exc, exc_info=True)
+            return []
+
+    # ------------------------------------------------------------------ #
+    # Firecrawl client property                                           #
+    # ------------------------------------------------------------------ #
 
     @property
     def firecrawl(self):
@@ -47,6 +83,10 @@ class WellfoundScraper(BaseScraper):
     def firecrawl(self, value):
         self._custom_firecrawl = value
         self._firecrawl_explicitly_set = True
+
+    # ------------------------------------------------------------------ #
+    # Search URL construction                                              #
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _slugify(text: str) -> str:
@@ -70,41 +110,69 @@ class WellfoundScraper(BaseScraper):
             urls.append(fallback)
         return urls
 
+    # ------------------------------------------------------------------ #
+    # HTML Parsing (strict: drops cards missing titles)                    #
+    # ------------------------------------------------------------------ #
+
     @staticmethod
     def _parse_jobs_from_html(html_text: str, search_location: Optional[str] = None) -> List[Job]:
         if not html_text:
             return []
         soup = BeautifulSoup(html_text, "html.parser")
         jobs: List[Job] = []
+
         for card in soup.find_all(attrs={"data-testid": "job-card"}):
-            title_el = card.find(["h2", "a"])
+            # 1. Title: strict search - never fabricate default title
+            title_el = card.select_one('[data-testid="job-title"], h2[class*="title"], h2, a[class*="title"]')
+            if not title_el:
+                title_el = card.find(["h2", "a"])
             title = title_el.get_text(strip=True) if title_el else ""
-            comp_el = card.find(["h4", "span"])
+
+            if not title:
+                logger.warning("[wellfound-html] dropping card without title")
+                continue
+
+            # 2. Company name: check specific selector, company link, or heading
+            comp_el = card.select_one('[data-testid="company-name"], a[href*="/company/"]')
+            if not comp_el:
+                comp_el = card.find(["h4"])
             company = comp_el.get_text(strip=True) if comp_el else "Startup (Wellfound)"
+
+            # 3. URL
             link = card.find("a", href=True)
             href = link["href"] if link else ""
             if href and not href.startswith("http"):
                 href = f"{BASE_URL}{href}"
+            if not href:
+                logger.warning("[wellfound-html] dropping card '%s' without URL", title)
+                continue
 
-            # Extract salary if present in text (e.g. ₹12,00,000)
+            # 4. Salary extraction from text if present
             card_text = card.get_text(" ", strip=True)
-            sal_match = re.search(r"([₹$€£][\d,]+(?:\s*-\s*[₹$€£][\d,]+)?)", card_text)
+            sal_match = re.search(r"([₹$€£][\d,]+(?:\s*[-–to]+\s*[₹$€£]?[\d,]+)?)", card_text)
             salary = sal_match.group(1) if sal_match else "Not specified"
 
             loc = search_location.title() if search_location else "Remote"
+            job_type = "Internship" if "intern" in title.lower() else "Full-time"
+
             jobs.append(
                 Job(
-                    title=title or "Software Engineer",
-                    company=company or "Startup (Wellfound)",
+                    title=title,
+                    company=company,
                     location=loc,
                     salary=salary,
+                    salary_raw=salary if salary != "Not specified" else None,
                     description="",
                     url=href,
                     source="wellfound",
-                    job_type="Full-time",
+                    job_type=job_type,
                 )
             )
         return jobs
+
+    # ------------------------------------------------------------------ #
+    # Markdown Parsing (Firecrawl format)                                  #
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _parse_jobs_from_markdown(md: str, search_location: Optional[str] = None) -> List[Job]:
@@ -123,13 +191,19 @@ class WellfoundScraper(BaseScraper):
             for text, href in matches:
                 if "/jobs/" in href.lower():
                     title = text.strip().strip("*# ")
+                    if not title:
+                        continue
                     company = None
 
                     # Check surrounding lines for company link
                     start = max(0, i - 2)
                     end = min(len(lines), i + 3)
                     for neighbor_line in lines[start:end]:
-                        comp_match = re.search(r"\[([^\]]+)\]\(https?://[^\)]*wellfound\.com/company/[^\)]+\)", neighbor_line, re.IGNORECASE)
+                        comp_match = re.search(
+                            r"\[([^\]]+)\]\(https?://[^\)]*wellfound\.com/company/[^\)]+\)",
+                            neighbor_line,
+                            re.IGNORECASE,
+                        )
                         if comp_match:
                             company = comp_match.group(1).strip()
                             break
@@ -143,6 +217,7 @@ class WellfoundScraper(BaseScraper):
                             company=comp_name,
                             location=loc,
                             salary="Not specified",
+                            salary_raw=None,
                             description="",
                             url=href,
                             source="wellfound",
@@ -151,8 +226,11 @@ class WellfoundScraper(BaseScraper):
                     )
         return jobs
 
+    # ------------------------------------------------------------------ #
+    # Scrape execution                                                     #
+    # ------------------------------------------------------------------ #
+
     def scrape_jobs(self, keywords: List[str], locations: List[str]) -> List[Job]:
-        # If firecrawl client was explicitly set to None or not provided without key
         if self._custom_firecrawl is None and not self.api_key:
             return []
         client = self.firecrawl
@@ -190,6 +268,3 @@ class WellfoundScraper(BaseScraper):
                     return jobs
 
         return []
-
-    def scrape(self, role: str, location: Optional[str] = None) -> List[Job]:
-        return self.scrape_jobs([role], [location] if location else [])
