@@ -125,7 +125,7 @@ class Settings(BaseSettings):
         ),
     )
     NAUKRI_APP_ID: str = Field(default="109")
-    NAUKRI_SYSTEM_ID: str = Field(default="109")
+    NAUKRI_SYSTEM_ID: str = Field(default="naukri")
     NAUKRI_USER_AGENT: str = Field(
         default=(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

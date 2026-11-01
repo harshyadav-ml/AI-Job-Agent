@@ -53,7 +53,7 @@ from src.models import Job
 from src.models.job import parse_date
 from src.processors.query_parser import ParsedQuery, QueryParser
 from src.scrapers.base import BaseScraper
-from src.utils.ua_rotator import build_request_headers
+from src.utils.ua_rotator import build_request_headers, get_random_ua
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ class NaukriScraper(BaseScraper):
     API_URL = "https://www.naukri.com/jobapi/v3/search"
     JOB_CARD_SELECTORS = (
         "article.jobTuple, div.srp-jobtuple-wrapper, div.cust-job-tuple, "
-        "div[data-job-id], [class*='styles_job-listing-container']"
+        "div[data-job-id], [class*='styles_job-listing-container'], .jobTuple"
     )
 
     def __init__(self) -> None:
@@ -79,14 +79,17 @@ class NaukriScraper(BaseScraper):
         self._API_URL = self.API_URL
         self.query_parser = QueryParser()
 
-        # Dynamic credentials from settings (no hardcoding)
+        # Strict API credentials matching Naukri WAF requirements:
+        # appid: "109", systemid: "naukri", and clientid from settings/.env
         self.API_HEADERS = {
-            "User-Agent": self.USER_AGENT,
-            "appid": getattr(settings, "NAUKRI_APP_ID", "109"),
-            "systemid": getattr(settings, "NAUKRI_SYSTEM_ID", "109"),
+            "User-Agent": get_random_ua(),
+            "appid": "109",
+            "systemid": "naukri",
             "clientid": getattr(settings, "NAUKRI_CLIENT_ID", "d3Wh4DeBn0q20"),
             "Accept": "application/json",
             "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.naukri.com/",
+            "Origin": "https://www.naukri.com",
         }
 
         self.session = requests.Session()
@@ -180,7 +183,10 @@ class NaukriScraper(BaseScraper):
         return unique_jobs
 
     def _scrape_with_browser(self, url: str) -> List[Job]:
-        """Render search URL with undetected-chromedriver and parse cards."""
+        """
+        Render search URL with undetected-chromedriver and parse cards.
+        Includes anti-bot evasion arguments and explicit WebDriverWait for job tuples.
+        """
         if not _UC_AVAILABLE:
             self.logger.warning("undetected-chromedriver not installed; skipping browser scrape")
             return []
@@ -188,22 +194,45 @@ class NaukriScraper(BaseScraper):
         driver = None
         try:
             options = uc.ChromeOptions()
+            # Anti-bot stealth arguments to bypass Cloudflare/Akamai fingerprinting
+            options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_argument("--no-sandbox")
-            options.add_argument("--window-size=1440,900")
             options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--start-maximized")
+            options.add_argument("--disable-infobars")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--disable-popup-blocking")
+
+            # Match browser UA with dynamic rotator
+            browser_ua = get_random_ua()
+            options.add_argument(f"--user-agent={browser_ua}")
 
             self._rate_limit()
-            # Let undetected-chromedriver auto-detect the installed Chrome version
+            # Launch undetected-chromedriver in non-headless mode to allow challenge resolution
             driver = uc.Chrome(options=options, headless=False)
             driver.get(url)
 
-            card_css = "#listContainer, div.srp-jobtuple-wrapper, div[data-job-id], article.jobTuple"
+            # Explicit WebDriverWait (15s) for job card container to allow Cloudflare challenge to clear
+            card_presence_css = (
+                ".srp-jobtuple-wrapper, .jobTuple, article.jobTuple, "
+                "div.srp-jobtuple-wrapper, div.cust-job-tuple, div[data-job-id]"
+            )
             try:
                 WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, card_css))
+                    EC.presence_of_element_located((By.CSS_SELECTOR, card_presence_css))
                 )
+                # Human-like micro-scroll and settling delay so lazy-loaded cards hydrate
+                driver.execute_script("window.scrollBy(0, 400);")
+                time.sleep(1.0)
             except Exception as wait_exc:
-                self.logger.warning("UC wait timed out: %s; parsing available DOM", wait_exc)
+                self.logger.warning(
+                    "WebDriverWait timed out after 15s waiting for job cards (%s). "
+                    "Current page title: '%s'. Parsing available DOM.",
+                    wait_exc,
+                    getattr(driver, "title", "Unknown"),
+                )
 
             soup = BeautifulSoup(driver.page_source, "html.parser")
             cards = self._find_job_cards(soup)
@@ -272,7 +301,7 @@ class NaukriScraper(BaseScraper):
         try:
             self._rate_limit()
             headers = {
-                "User-Agent": self.USER_AGENT,
+                "User-Agent": get_random_ua(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://www.google.com/",
@@ -298,7 +327,8 @@ class NaukriScraper(BaseScraper):
         for attempt in range(retries):
             try:
                 self._rate_limit()
-                response = self.session.get(url, timeout=settings.TIMEOUT)
+                headers = {"User-Agent": get_random_ua()}
+                response = self.session.get(url, headers=headers, timeout=settings.TIMEOUT)
                 if response.status_code == 200 and response.text:
                     return response.text
                 self.logger.warning("Naukri HTML request returned HTTP %s", response.status_code)
@@ -318,10 +348,11 @@ class NaukriScraper(BaseScraper):
                         "--disable-blink-features=AutomationControlled",
                         "--disable-dev-shm-usage",
                         "--no-sandbox",
+                        "--disable-gpu",
                     ],
                 )
                 context = browser.new_context(
-                    user_agent=self.USER_AGENT,
+                    user_agent=get_random_ua(),
                     viewport={"width": 1366, "height": 768},
                     locale="en-US",
                 )
@@ -338,7 +369,11 @@ class NaukriScraper(BaseScraper):
             return None
 
     def _fetch_api_jobs(self, keyword: str, location: str) -> List[Job]:
-        """Fetch listings via internal Naukri REST API."""
+        """
+        Fetch listings via internal Naukri REST API.
+        Strictly requires appid: '109', systemid: 'naukri', clientid from env,
+        and dynamically synchronized User-Agent from ua_rotator.
+        """
         params = {
             "noOfResults": 20,
             "urlType": "search_by_keyword",
@@ -351,9 +386,30 @@ class NaukriScraper(BaseScraper):
         }
         try:
             self._rate_limit()
-            response = self.session.get(self.API_URL, params=params, timeout=settings.TIMEOUT)
+            # Match User-Agent dynamically with ua_rotator
+            current_ua = get_random_ua()
+            self.API_HEADERS.update({
+                "User-Agent": current_ua,
+                "appid": "109",
+                "systemid": "naukri",
+                "clientid": getattr(settings, "NAUKRI_CLIENT_ID", "d3Wh4DeBn0q20"),
+                "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.naukri.com/",
+                "Origin": "https://www.naukri.com",
+            })
+            self.session.headers.update(self.API_HEADERS)
+
+            response = self.session.get(
+                self.API_URL,
+                params=params,
+                headers=self.API_HEADERS,
+                timeout=settings.TIMEOUT,
+            )
             if response.status_code in (403, 406):
-                raise requests.HTTPError(f"Naukri API blocked request with HTTP {response.status_code}")
+                raise requests.HTTPError(
+                    f"Naukri API blocked request with HTTP {response.status_code}: {response.text[:120]}"
+                )
             response.raise_for_status()
             payload = response.json()
             details = payload.get("jobDetails", []) if isinstance(payload, dict) else []
@@ -404,12 +460,14 @@ class NaukriScraper(BaseScraper):
 
     def _find_job_cards(self, soup: BeautifulSoup) -> List[Tag]:
         for selector in [
-            "article.jobTuple",
+            ".srp-jobtuple-wrapper",
             "div.srp-jobtuple-wrapper",
+            ".jobTuple",
+            "article.jobTuple",
+            "div.jobTuple",
             "div.cust-job-tuple",
             "div[data-job-id]",
             "[class*='styles_job-listing-container']",
-            "div.jobTuple",
         ]:
             cards = soup.select(selector)
             if cards:
@@ -424,21 +482,21 @@ class NaukriScraper(BaseScraper):
         return name.strip()
 
     def _parse_job_card(self, card: Tag) -> Optional[Job]:
-        title = self._extract_text(card, ["a.title", "div.row1 a", "h2 a", ".job-title a"])
+        title = self._extract_text(card, ["a.title", "div.row1 a", "h2 a", ".job-title a", "a[class*='title']"])
         if not title:
             return None
-        description = self._extract_text(card, [".job-description", ".description"])
+        description = self._extract_text(card, [".job-description", ".description", ".job-desc", "div.row4"])
         company = self._clean_company_name(
-            self._extract_text(card, ["a.comp-name", "div.row2 span a", ".company-name a"])
+            self._extract_text(card, ["a.comp-name", "div.row2 span a", ".company-name a", "a[class*='comp-name']"])
         )
         return self._make_job(
             title=title,
             company=company or "N/A",
-            location=self._extract_text(card, ["span.loc-wrap", ".location span", ".job-location"]) or "Not specified",
+            location=self._extract_text(card, ["span.loc-wrap", ".location span", ".job-location", "span[class*='loc']"]) or "Not specified",
             description=description,
-            salary=self._extract_text(card, ["span.sal-wrap", ".salary span"]),
-            url=self._extract_attribute(card, ["a.title", "div.row1 a"], "href"),
-            posted_date=self._extract_text(card, ["span.job-post-day", ".posting-date"]),
+            salary=self._extract_text(card, ["span.sal-wrap", ".salary span", "span[class*='sal']"]),
+            url=self._extract_attribute(card, ["a.title", "div.row1 a", "h2 a", "a[class*='title']"], "href"),
+            posted_date=self._extract_text(card, ["span.job-post-day", ".posting-date", "span[class*='date']"]),
         )
 
     def _parse_rendered_card(self, card: Any) -> Optional[Job]:
@@ -556,7 +614,11 @@ class NaukriScraper(BaseScraper):
         seen = set()
         unique = []
         for job in jobs:
-            key = job.job_id or f"{job.title.lower()}|{job.company.lower()}|{job.location.lower()}"
+            key = (
+                (job.title or "").strip().lower(),
+                (job.company or "").strip().lower(),
+                (job.location or "").strip().lower(),
+            )
             if key not in seen:
                 seen.add(key)
                 unique.append(job)
